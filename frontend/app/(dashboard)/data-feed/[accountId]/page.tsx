@@ -1,0 +1,682 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useState } from "react";
+import { useParams } from "next/navigation";
+import { ArrowLeft, FlaskConical } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { DateInput } from "@/components/ui/date-input";
+import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
+import { ApiError, apiFetch } from "@/lib/api";
+import {
+  datePresetMonths,
+  datePresetFirstMonthOfYear,
+  fetchAccountDetail,
+  fillHistory,
+  importMonoHistory,
+  cleanupKeepSyntheticOnlyUser,
+  pauseLiveFeed,
+  purgeMonoDummies,
+  resetSynthetic,
+  PERSONA_LABELS,
+  runLiveDripNow,
+  saveProfile,
+  startLiveFeed,
+  type PersonaType,
+  type SyntheticFeedProfile,
+  type SyntheticFeedRun,
+} from "@/lib/data-feed";
+
+const selectClass =
+  "h-10 w-full rounded-md border border-slate-700 bg-slate-900 px-3 text-sm text-white focus:outline-none focus:ring-2 focus:ring-blue-500";
+
+const PERSONA_TYPES: PersonaType[] = ["individual", "freelancer", "small_business", "retail"];
+
+export default function DataFeedAccountPage() {
+  const params = useParams();
+  const accountId = params.accountId as string;
+
+  const [loading, setLoading] = useState(true);
+  const [profile, setProfile] = useState<SyntheticFeedProfile | null>(null);
+  const [runs, setRuns] = useState<SyntheticFeedRun[]>([]);
+  const [presets, setPresets] = useState<Record<string, Record<string, unknown>>>({});
+  const [stats, setStats] = useState<{ total: number; synthetic: number; mono_imported: number; non_synthetic: number } | null>(null);
+
+  const [personaType, setPersonaType] = useState<PersonaType>("individual");
+  const [dailyTxMin, setDailyTxMin] = useState(8);
+  const [dailyTxMax, setDailyTxMax] = useState(20);
+  const [remarkRate, setRemarkRate] = useState(0.25);
+  const [liveIntervalHours, setLiveIntervalHours] = useState(6);
+  const [autoClassify, setAutoClassify] = useState(true);
+
+  const [histStart, setHistStart] = useState("");
+  const [histEnd, setHistEnd] = useState("");
+  const [fillStart, setFillStart] = useState("");
+  const [fillEnd, setFillEnd] = useState("");
+  const [fillCount, setFillCount] = useState("20");
+  const [isMonoSandbox, setIsMonoSandbox] = useState(true);
+  const [showMonoImport, setShowMonoImport] = useState(false);
+
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const dev = await apiFetch<{ mono_env?: string }>("/banking/dev-info").catch(
+        (): { mono_env?: string } => ({})
+      );
+      const sandbox = dev.mono_env === "sandbox";
+      setIsMonoSandbox(sandbox);
+      setShowMonoImport(!sandbox);
+
+      const data = await fetchAccountDetail(accountId);
+      setProfile(data.profile);
+      setRuns(data.runs);
+      setPresets(data.presets);
+      setStats(data.stats ?? null);
+      const p = data.profile;
+      setPersonaType(p.persona_type as PersonaType);
+      setDailyTxMin(p.daily_tx_min ?? Math.max(1, p.daily_tx_target - 7));
+      setDailyTxMax(p.daily_tx_max ?? Math.min(500, p.daily_tx_target + 7));
+      setLiveIntervalHours(p.live_interval_hours);
+      setAutoClassify(p.auto_classify);
+      const cfg = p.persona_config as { remark_rate?: number };
+      if (cfg.remark_rate != null) setRemarkRate(cfg.remark_rate);
+      if (p.historical_start) setHistStart(String(p.historical_start).slice(0, 10));
+      if (p.historical_end) setHistEnd(String(p.historical_end).slice(0, 10));
+      const preset = datePresetFirstMonthOfYear();
+      setFillStart(preset.start);
+      setFillEnd(preset.end);
+    } catch (err) {
+      const msg =
+        err instanceof ApiError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : "Failed to load";
+      setError(msg);
+    } finally {
+      setLoading(false);
+    }
+  }, [accountId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  function applyPreset(type: PersonaType) {
+    setPersonaType(type);
+    const preset = presets[type];
+    if (preset && typeof preset.daily_tx_min === "number" && typeof preset.daily_tx_max === "number") {
+      setDailyTxMin(preset.daily_tx_min);
+      setDailyTxMax(preset.daily_tx_max);
+    }
+    if (preset && typeof preset.remark_rate === "number") {
+      setRemarkRate(preset.remark_rate);
+    }
+  }
+
+  async function persistProfile() {
+    const res = await saveProfile(accountId, {
+      persona_type: personaType,
+      persona_config: { remark_rate: remarkRate },
+      daily_tx_min: dailyTxMin,
+      daily_tx_max: dailyTxMax,
+      live_interval_hours: liveIntervalHours,
+      auto_classify: autoClassify,
+      historical_start: histStart || undefined,
+      historical_end: histEnd || undefined,
+    });
+    setProfile(res.profile);
+    return res.profile;
+  }
+
+  async function handleSaveProfile() {
+    setBusy("save");
+    setError(null);
+    try {
+      await persistProfile();
+      setMessage("Persona saved.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Save failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleImportMono() {
+    if (!histStart || !histEnd) {
+      setError("Set historical start and end dates.");
+      return;
+    }
+    setBusy("import");
+    setError(null);
+    try {
+      const res = await importMonoHistory(accountId, histStart, histEnd);
+      setMessage(`Imported ${res.imported} transaction(s) from bank feed.`);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Import failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleFillHistory() {
+    if (!fillStart || !fillEnd) {
+      setError("Set fill history date range.");
+      return;
+    }
+    setBusy("fill");
+    setError(null);
+    setMessage(null);
+    try {
+      await persistProfile();
+      const count = fillCount ? parseInt(fillCount, 10) : undefined;
+      const res = await fillHistory(accountId, fillStart, fillEnd, count);
+      setMessage(
+        res.classify_pending
+          ? `Generated ${res.created} synthetic transaction(s). Auto-classify is running in the background — check Books in a minute. Open Transactions and filter by Synthetic.`
+          : `Generated ${res.created} synthetic transaction(s). Open Transactions and filter by Synthetic to view them.`
+      );
+      try {
+        await load();
+      } catch {
+        setMessage(
+          (prev) =>
+            `${prev ?? ""} Page stats could not refresh — use Retry or open Transactions to confirm.`.trim()
+        );
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Fill failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleStartLive() {
+    setBusy("live-start");
+    setError(null);
+    try {
+      await persistProfile();
+      const res = await startLiveFeed(accountId);
+      setProfile(res.profile);
+      const hours = res.profile.live_interval_hours || res.interval_hours || 6;
+      if (res.first_drip?.created) {
+        setMessage(
+          `Live feed started — created ${res.first_drip.created} transaction(s). Next automatic drip in ${hours}h.`
+        );
+      } else if (res.first_drip_error) {
+        setError(`Live feed enabled but the first drip failed: ${res.first_drip_error}`);
+      } else {
+        setMessage(`Live feed started. New transactions will drip automatically every ${hours}h.`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start live feed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handlePurgeMonoDummies() {
+    if (
+      !window.confirm(
+        "Remove all imported bank rows for this account? Synthetic transactions are kept."
+      )
+    ) {
+      return;
+    }
+    setBusy("purge");
+    setError(null);
+    try {
+      const res = await purgeMonoDummies(accountId);
+      setMessage(
+        `Removed ${res.archived} imported row(s). ${res.remaining_synthetic} synthetic remain (${res.remaining_total} total).`
+      );
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Purge failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleKeepSyntheticOnly() {
+    if (
+      !window.confirm(
+        "Remove ALL non-synthetic transactions across every bank account? Synthetic rows are kept."
+      )
+    ) {
+      return;
+    }
+    setBusy("keep-synthetic");
+    setError(null);
+    try {
+      const res = await cleanupKeepSyntheticOnlyUser();
+      setMessage(
+        `Removed ${res.archived} bank import row(s). ${res.remaining_synthetic} synthetic remain — check Transactions (Source → Synthetic).`
+      );
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Cleanup failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleResetSynthetic() {
+    if (
+      !window.confirm(
+        "Remove all synthetic transactions for this account? Use this before a fresh Fill history if you ran fill multiple times."
+      )
+    ) {
+      return;
+    }
+    setBusy("reset-synthetic");
+    setError(null);
+    try {
+      const res = await resetSynthetic(accountId);
+      setMessage(`Removed ${res.archived} synthetic row(s). Run Fill history again for a clean dataset.`);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Reset failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handlePauseLive() {
+    setBusy("live-pause");
+    try {
+      const res = await pauseLiveFeed(accountId);
+      setProfile(res.profile);
+      setMessage("Live feed paused.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not pause");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleRunNow() {
+    setBusy("run-now");
+    try {
+      const res = await runLiveDripNow(accountId);
+      setMessage(`Drip: ${res.created} new transaction(s).`);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Drip failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="page-enter space-y-6">
+        <Skeleton className="h-8 w-64" />
+        <Skeleton className="h-48 w-full" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="page-enter space-y-6">
+      <div className="flex items-center gap-3">
+        <Button variant="ghost" size="sm" asChild>
+          <Link href="/data-feed">
+            <ArrowLeft className="mr-1 h-4 w-4" />
+            Back
+          </Link>
+        </Button>
+        <FlaskConical className="h-5 w-5 text-amber-400" />
+        <h1 className="text-xl font-bold text-white">Configure data feed</h1>
+        {profile?.live_feed_enabled && (
+          <Badge className="border-green-500/30 bg-green-950/40 text-green-300">Live</Badge>
+        )}
+      </div>
+
+      {message && (
+        <p className="rounded-lg border border-green-900/50 bg-green-950/30 px-4 py-3 text-sm text-green-300">
+          {message}
+        </p>
+      )}
+      {error && (
+        <div className="rounded-lg border border-red-900/50 bg-red-950/30 px-4 py-3 text-sm text-red-300">
+          <p>{error}</p>
+          <Button variant="outline" size="sm" className="mt-3" onClick={() => void load()}>
+            Retry
+          </Button>
+        </div>
+      )}
+
+      <div className="rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-3 text-sm text-slate-400">
+        <p className="font-medium text-slate-300">Recommended workflow (test mode)</p>
+        <ol className="mt-2 list-inside list-decimal space-y-1">
+          <li>
+            <strong className="text-slate-300">Persona</strong> — pick account type, daily volume range, remark rate.
+          </li>
+          <li>
+            <strong className="text-slate-300">Fill history</strong> — generate realistic synthetic transactions spread
+            across past dates (main data source in sandbox).
+          </li>
+          <li>
+            <strong className="text-slate-300">Live feed</strong> — drip new synthetic transactions going forward.
+          </li>
+          <li>
+            <strong className="text-slate-300">Bank import (optional)</strong> — only if you want live provider rows;
+            often the same data regardless of date range.
+          </li>
+        </ol>
+      </div>
+
+      {isMonoSandbox && (
+        <div className="rounded-lg border border-amber-900/40 bg-amber-950/20 px-4 py-3 text-sm text-amber-200/90">
+          <p>
+            Bank import is <strong>disabled automatically</strong> on connect and sync in test mode. Use{" "}
+            <strong>Fill history</strong> after saving a persona.
+          </p>
+          {stats && (
+            <p className="mt-2 text-xs text-amber-200/70">
+              This account: <strong>{stats.total}</strong> total · <strong>{stats.synthetic}</strong> synthetic ·{" "}
+              <strong>{stats.mono_imported}</strong> imported rows · <strong>{stats.non_synthetic}</strong> non-synthetic
+            </p>
+          )}
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              className="border-red-900/50 text-red-300 hover:bg-red-950/30"
+              onClick={handleKeepSyntheticOnly}
+              loading={busy === "keep-synthetic"}
+              loadingLabel="Cleaning…"
+            >
+              Keep synthetic only (all accounts)
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handlePurgeMonoDummies}
+              loading={busy === "purge"}
+              loadingLabel="Removing…"
+            >
+              Remove imported rows
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleResetSynthetic}
+              loading={busy === "reset-synthetic"}
+              loadingLabel="Resetting…"
+            >
+              Reset synthetic (re-fill)
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Persona */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">1. Persona</CardTitle>
+          <CardDescription>
+            Start here. Defines transaction types (transfers, POS, airtime, fees), daily volume range, and how often
+            narrations include a user remark (most Nigerian transfers have none).
+          </CardDescription>
+        </CardHeader>
+        <div className="space-y-4 px-6 pb-6">
+          <div className="flex flex-wrap gap-2">
+            {PERSONA_TYPES.map((t) => (
+              <Button
+                key={t}
+                variant={personaType === t ? "default" : "outline"}
+                size="sm"
+                onClick={() => applyPreset(t)}
+              >
+                {PERSONA_LABELS[t]}
+              </Button>
+            ))}
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <label className="mb-1.5 block text-xs text-slate-400">Daily transactions (min)</label>
+              <Input
+                type="number"
+                min={1}
+                max={500}
+                value={dailyTxMin}
+                onChange={(e) => setDailyTxMin(parseInt(e.target.value, 10) || 1)}
+              />
+            </div>
+            <div>
+              <label className="mb-1.5 block text-xs text-slate-400">Daily transactions (max)</label>
+              <Input
+                type="number"
+                min={1}
+                max={500}
+                value={dailyTxMax}
+                onChange={(e) => setDailyTxMax(parseInt(e.target.value, 10) || 1)}
+              />
+            </div>
+            <div>
+              <label className="mb-1.5 block text-xs text-slate-400">Live feed interval (hours)</label>
+              <select
+                className={selectClass}
+                value={liveIntervalHours}
+                onChange={(e) => setLiveIntervalHours(parseInt(e.target.value, 10))}
+              >
+                <option value={6}>Every 6 hours</option>
+                <option value={12}>Every 12 hours</option>
+                <option value={24}>Daily</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="mb-1.5 block text-xs text-slate-400">
+              Remark rate ({Math.round(remarkRate * 100)}% of transfers include a user description)
+            </label>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              value={Math.round(remarkRate * 100)}
+              onChange={(e) => setRemarkRate(parseInt(e.target.value, 10) / 100)}
+              className="w-full accent-blue-500"
+            />
+          </div>
+          <label className="flex items-center gap-2 text-sm text-slate-300">
+            <input
+              type="checkbox"
+              checked={autoClassify}
+              onChange={(e) => setAutoClassify(e.target.checked)}
+              className="rounded border-slate-600 bg-slate-900"
+            />
+            Auto-classify new transactions for Books
+          </label>
+          <Button onClick={handleSaveProfile} loading={busy === "save"} variant="outline">
+            Save persona
+          </Button>
+        </div>
+      </Card>
+
+      {/* Fill history */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">2. Fill history</CardTitle>
+          <CardDescription>
+            Generates Nigeria-realistic synthetic transactions across a past date range — tagged Synthetic in
+            Transactions. Spread across dates so Reports and filters behave realistically. Recommended as your first data
+            step in test mode.
+          </CardDescription>
+        </CardHeader>
+        <div className="space-y-4 px-6 pb-6">
+          <div className="grid gap-4 sm:grid-cols-3">
+            <div>
+              <label className="mb-1.5 block text-xs text-slate-400">Start</label>
+              <DateInput value={fillStart} onChange={(e) => setFillStart(e.target.value)} />
+            </div>
+            <div>
+              <label className="mb-1.5 block text-xs text-slate-400">End</label>
+              <DateInput value={fillEnd} onChange={(e) => setFillEnd(e.target.value)} />
+            </div>
+            <div>
+              <label className="mb-1.5 block text-xs text-slate-400">Count (recommended: 20 for testing)</label>
+              <Input
+                placeholder="20"
+                value={fillCount}
+                onChange={(e) => setFillCount(e.target.value)}
+              />
+            </div>
+          </div>
+          <Button
+            onClick={handleFillHistory}
+            loading={busy === "fill"}
+            loadingLabel="Generating history…"
+          >
+            Fill history
+          </Button>
+          <p className="text-xs text-slate-500">
+            Saves your persona, then generates transactions on the server. Defaults to the first month of this year
+            with count 20 — leave count blank only if you want hundreds of rows. Large fills can take up to a minute.
+          </p>
+        </div>
+      </Card>
+
+      {/* Live feed */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">3. Live feed</CardTitle>
+          <CardDescription>
+            Adds a small batch of new synthetic transactions automatically on a timer (default every 6 hours).
+            Starting the feed runs the first batch immediately — no need to click Run drip now unless testing.
+          </CardDescription>
+        </CardHeader>
+        <div className="flex flex-wrap gap-2 px-6 pb-2">
+          <p className="w-full text-xs text-slate-500">
+            ~{Math.max(1, Math.round((dailyTxMin + dailyTxMax) / 2 / Math.max(1, 24 / liveIntervalHours)))}{" "}
+            transactions every {liveIntervalHours}h ({dailyTxMin}–{dailyTxMax}/day range)
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2 px-6 pb-6">
+          {!profile?.live_feed_enabled ? (
+            <Button onClick={handleStartLive} loading={busy === "live-start"}>
+              Start live feed
+            </Button>
+          ) : (
+            <Button onClick={handlePauseLive} variant="outline" loading={busy === "live-pause"}>
+              Pause live feed
+            </Button>
+          )}
+          <Button onClick={handleRunNow} variant="outline" loading={busy === "run-now"}>
+            Run drip now
+          </Button>
+          {profile?.next_live_run_at && (
+            <span className="self-center text-xs text-slate-500">
+              Next run: {new Date(profile.next_live_run_at).toLocaleString()}
+            </span>
+          )}
+        </div>
+      </Card>
+
+      {/* Optional bank import */}
+      <Card>
+        <CardHeader className="flex flex-row items-start justify-between gap-4 space-y-0">
+          <div>
+            <CardTitle className="text-base">Optional: historical bank import</CardTitle>
+            <CardDescription>
+              Pulls live provider data for a date range. In test mode this is often the same few transactions (or none)
+              regardless of date range — skip unless you need provider rows mixed with synthetic data.
+            </CardDescription>
+          </div>
+          <Button variant="outline" size="sm" onClick={() => setShowMonoImport((v) => !v)}>
+            {showMonoImport ? "Hide" : "Show"}
+          </Button>
+        </CardHeader>
+        {showMonoImport && (
+          <div className="space-y-4 px-6 pb-6">
+            <div className="flex flex-wrap gap-2">
+              {[3, 6, 12].map((m) => {
+                const p = datePresetMonths(m);
+                return (
+                  <Button
+                    key={m}
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setHistStart(p.start);
+                      setHistEnd(p.end);
+                    }}
+                  >
+                    Last {m} months
+                  </Button>
+                );
+              })}
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div>
+                <label className="mb-1.5 block text-xs text-slate-400">Start</label>
+                <DateInput value={histStart} onChange={(e) => setHistStart(e.target.value)} />
+              </div>
+              <div>
+                <label className="mb-1.5 block text-xs text-slate-400">End</label>
+                <DateInput value={histEnd} onChange={(e) => setHistEnd(e.target.value)} />
+              </div>
+            </div>
+            <Button onClick={handleImportMono} loading={busy === "import"} loadingLabel="Importing…">
+              Import from bank
+            </Button>
+          </div>
+        )}
+      </Card>
+
+      {/* Run log */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Run log</CardTitle>
+          <CardDescription>History of bank imports, history fills, and live drips for this account.</CardDescription>
+        </CardHeader>
+        <div className="overflow-x-auto px-6 pb-6">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-slate-800 text-left text-slate-400">
+                <th className="pb-2 pr-4">Type</th>
+                <th className="pb-2 pr-4">Created</th>
+                <th className="pb-2 pr-4">Status</th>
+                <th className="pb-2">When</th>
+              </tr>
+            </thead>
+            <tbody>
+              {runs.length === 0 ? (
+                <tr>
+                  <td colSpan={4} className="py-4 text-slate-500">
+                    No runs yet
+                  </td>
+                </tr>
+              ) : (
+                runs.map((run) => (
+                  <tr key={run.id} className="border-b border-slate-800/50">
+                    <td className="py-2 pr-4 capitalize text-slate-300">{run.run_type.replace("_", " ")}</td>
+                    <td className="py-2 pr-4 text-slate-400">{run.transactions_created}</td>
+                    <td className="py-2 pr-4">
+                      <Badge variant={run.status === "completed" ? "success" : run.status === "failed" ? "destructive" : "secondary"}>
+                        {run.status}
+                      </Badge>
+                    </td>
+                    <td className="py-2 text-xs text-slate-500">
+                      {new Date(run.started_at).toLocaleString()}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+}
